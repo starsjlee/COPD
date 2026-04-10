@@ -46,7 +46,7 @@ import seaborn as sns
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
-from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict, train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (classification_report, confusion_matrix,
                              roc_auc_score, roc_curve, accuracy_score)
@@ -124,8 +124,7 @@ def get_measuring(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def scan_dataset(data_dir: Path):
-    patients     = defaultdict(lambda: {"label": None, "sessions": []})
-    gas_col_sets = []
+    patients = defaultdict(lambda: {"label": None, "sessions": []})
 
     for label_dir in ["COPD", "HD"]:
         folder = data_dir / label_dir
@@ -145,24 +144,46 @@ def scan_dataset(data_dir: Path):
                 continue
             patients[pat_id]["label"] = label
             patients[pat_id]["sessions"].append(sensor_files)
-            if "GAS" in sensor_files:
-                df_gas = load_csv(sensor_files["GAS"])
-                df_m   = get_measuring(df_gas)
-                if len(df_m) > 0:
-                    gas_col_sets.append(set(df_m.columns))
-
-    gas_common = sorted(set.intersection(*gas_col_sets)) if gas_col_sets else []
-
     print(f"\n📋 스캔 결과:")
     n_copd = sum(1 for v in patients.values() if v["label"] == "COPD")
     n_hd   = sum(1 for v in patients.values() if v["label"] == "HD")
     print(f"  COPD 환자: {n_copd}명")
     print(f"  HD 환자  : {n_hd}명")
-    print(f"  GAS 공통 컬럼: {len(gas_common)}개")
     total_sessions = sum(len(v["sessions"]) for v in patients.values())
     print(f"  총 세션 수: {total_sessions}개 (환자당 평균 {total_sessions/len(patients):.1f}개)")
 
-    return dict(patients), gas_common
+    return dict(patients)
+
+
+def get_patient_ids_and_labels(patients: dict):
+    patient_ids = sorted(patients.keys())
+    labels = np.array([1 if patients[pid]["label"] == "COPD" else 0 for pid in patient_ids])
+    return patient_ids, labels
+
+
+def subset_patients(patients: dict, patient_ids) -> dict:
+    return {pid: patients[pid] for pid in patient_ids if pid in patients}
+
+
+def compute_gas_common_cols(patients_subset: dict):
+    gas_col_sets = []
+    for info in patients_subset.values():
+        for sfiles in info["sessions"]:
+            if "GAS" not in sfiles:
+                continue
+            df_gas = load_csv(sfiles["GAS"])
+            df_m = get_measuring(df_gas)
+            if len(df_m) > 0:
+                gas_col_sets.append(set(df_m.columns))
+    return sorted(set.intersection(*gas_col_sets)) if gas_col_sets else []
+
+
+def align_feature_columns(df_ref: pd.DataFrame, df_target: pd.DataFrame):
+    cols = sorted(df_ref.columns)
+    return (
+        df_ref.reindex(columns=cols, fill_value=0),
+        df_target.reindex(columns=cols, fill_value=0),
+    )
 
 
 def make_output_dir(base_dir: Path) -> Path:
@@ -333,6 +354,8 @@ def patient_to_tensors(info: dict, gas_common_cols: list, seq_len: int):
         if col_filter:
             df_cat = df_cat[[c for c in col_filter if c in df_cat.columns]]
         df_cat = df_cat.fillna(0)
+        if df_cat.shape[1] == 0:
+            return None
         col_names = list(df_cat.columns)
         arr = df_cat.values.T.astype(np.float32)    # (C, T)
         T = arr.shape[1]
@@ -499,36 +522,63 @@ class MultiSensorCNN(nn.Module):
 # 5. 학습 루프 (v2와 동일 구조, 모델 교체)
 # ──────────────────────────────────────────────
 
-def train_dl(samples, device, output_dir: Path,
-             epochs=60, batch_size=8, lr=1e-3, n_splits=5):
+def build_samples(patients_subset: dict, gas_common_cols: list, seq_len: int):
+    samples = []
+    for pat_id, info in sorted(patients_subset.items()):
+        result = patient_to_tensors(info, gas_common_cols, seq_len)
+        if result is None:
+            print(f"  ⚠️  {pat_id}: 텐서 변환 실패 → 건너뜀")
+            continue
+        tensors, col_names_list = result
+        label_val = 1 if info["label"] == "COPD" else 0
+        samples.append(((tensors, col_names_list), label_val))
+    return samples
 
-    dataset    = SensorDataset(samples)
-    labels_all = [s[1] for s in samples]
-    skf        = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    indices    = np.arange(len(dataset))
 
-    ch_1x1 = samples[0][0][0][0].shape[0]
-    ch_4x4 = samples[0][0][0][1].shape[0]
-    ch_gas  = samples[0][0][0][2].shape[0]
+def train_dl(patients, device, output_dir: Path,
+             seq_len=900, epochs=60, batch_size=8, lr=1e-3, n_splits=5):
+
+    patient_ids, labels_all = get_patient_ids_and_labels(patients)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     fold_metrics = []
     all_probs, all_trues = [], []
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(indices, labels_all)):
-        print(f"\n  [DL] Fold {fold+1}/{n_splits}  (train={len(train_idx)}, val={len(val_idx)})")
+    for fold, (train_idx, val_idx) in enumerate(skf.split(patient_ids, labels_all)):
+        train_ids = [patient_ids[i] for i in train_idx]
+        val_ids = [patient_ids[i] for i in val_idx]
+        train_patients = subset_patients(patients, train_ids)
+        val_patients = subset_patients(patients, val_ids)
+        train_gas_common_cols = compute_gas_common_cols(train_patients)
 
-        train_sub = torch.utils.data.Subset(dataset, train_idx)
-        val_sub   = torch.utils.data.Subset(dataset, val_idx)
+        print(
+            f"\n  [DL] Fold {fold+1}/{n_splits}  "
+            f"(train={len(train_patients)}, val={len(val_patients)}, "
+            f"train-gas-cols={len(train_gas_common_cols)})"
+        )
 
-        train_labels = [labels_all[i] for i in train_idx]
+        train_samples = build_samples(train_patients, train_gas_common_cols, seq_len)
+        val_samples = build_samples(val_patients, train_gas_common_cols, seq_len)
+        if not train_samples or not val_samples:
+            print("  ⚠️  유효한 학습/검증 샘플 부족으로 fold를 건너뜁니다.")
+            continue
+
+        train_dataset = SensorDataset(train_samples)
+        val_dataset = SensorDataset(val_samples)
+
+        ch_1x1 = train_samples[0][0][0][0].shape[0]
+        ch_4x4 = train_samples[0][0][0][1].shape[0]
+        ch_gas = train_samples[0][0][0][2].shape[0]
+
+        train_labels = [label for _, label in train_samples]
         class_counts = np.bincount(train_labels)
         weights  = [1.0 / class_counts[l] for l in train_labels]
         sampler  = WeightedRandomSampler(weights, len(weights), replacement=True)
 
-        train_loader = DataLoader(train_sub, batch_size=batch_size,
+        train_loader = DataLoader(train_dataset, batch_size=batch_size,
                                   sampler=sampler, collate_fn=collate_fn,
                                   num_workers=2, pin_memory=(device.type == "cuda"))
-        val_loader   = DataLoader(val_sub, batch_size=batch_size,
+        val_loader   = DataLoader(val_dataset, batch_size=batch_size,
                                   shuffle=False, collate_fn=collate_fn,
                                   num_workers=2, pin_memory=(device.type == "cuda"))
 
@@ -639,6 +689,30 @@ def plot_feature_importance(model, output_dir, top_n=30):
     plt.close()
 
 
+def make_xgb_classifier(xgb_params: dict):
+    return xgb.XGBClassifier(**xgb_params)
+
+
+def fit_xgb_with_fallback(model, xgb_params: dict, X_train, y_train, eval_set=None):
+    fit_kwargs = {"verbose": False}
+    if eval_set is not None:
+        fit_kwargs["eval_set"] = eval_set
+
+    try:
+        model.fit(X_train, y_train, **fit_kwargs)
+        return model, xgb_params
+    except (ValueError, xgb.core.XGBoostError) as exc:
+        if "gpu_hist" not in str(exc) and "gpu_hist" not in repr(exc):
+            raise
+        print("  ⚠️  현재 XGBoost 빌드에서 GPU를 지원하지 않습니다. CPU hist로 재시도합니다.")
+        fallback_params = dict(xgb_params)
+        fallback_params["tree_method"] = "hist"
+        fallback_params["device"] = "cpu"
+        fallback_model = make_xgb_classifier(fallback_params)
+        fallback_model.fit(X_train, y_train, **fit_kwargs)
+        return fallback_model, fallback_params
+
+
 # ──────────────────────────────────────────────
 # 7. Main
 # ──────────────────────────────────────────────
@@ -656,7 +730,7 @@ def main(args):
         print("⚠️  GPU 없음, CPU 실행")
 
     print("\n📂 데이터 스캔 중...")
-    patients, gas_common_cols = scan_dataset(data_dir)
+    patients = scan_dataset(data_dir)
 
     if len(patients) == 0:
         print("❌ 환자 데이터 없음. --data_dir 경로를 확인하세요.")
@@ -671,14 +745,17 @@ def main(args):
         print("🌲 ML 분석 (XGBoost + Statistical Features v3)")
         print("="*55)
 
-        print("  Feature 추출 중 (GAS 시간 구간 feature 포함)...")
-        df_feat, y, patient_ids = build_feature_matrix(patients, gas_common_cols)
-        X = df_feat.values
-        print(f"  Feature matrix: {X.shape}  (HD={sum(y==0)}, COPD={sum(y==1)})")
+        export_gas_cols = compute_gas_common_cols(patients)
+
+        print("  Feature 추출 중 (전체 export 용 matrix 생성)...")
+        df_feat, y_export, export_patient_ids = build_feature_matrix(patients, export_gas_cols)
+        print(f"  Feature matrix: {df_feat.shape}  (HD={sum(y_export==0)}, COPD={sum(y_export==1)})")
+        patient_ids = export_patient_ids
+        y = y_export
 
         df_save = df_feat.copy()
-        df_save.insert(0, "patient_id", patient_ids)
-        df_save.insert(1, "label", ["COPD" if v == 1 else "HD" for v in y])
+        df_save.insert(0, "patient_id", export_patient_ids)
+        df_save.insert(1, "label", ["COPD" if v == 1 else "HD" for v in y_export])
         df_save.to_csv(output_dir / "feature_matrix.csv", index=False)
 
         scale_pos = max(sum(y==0), sum(y==1)) / min(sum(y==0), sum(y==1))
@@ -694,50 +771,71 @@ def main(args):
             "device": "cuda" if device.type == "cuda" else "cpu",
             "random_state": 42,
         }
-        xgb_clf = xgb.XGBClassifier(**xgb_params)
 
         skf = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=42)
-        try:
-            cv_scores = cross_val_score(xgb_clf, X, y, cv=skf, scoring="roc_auc")
-        except ValueError as exc:
-            if "gpu_hist" in str(exc) or "gpu_hist" in repr(exc):
-                print("  ⚠️  현재 XGBoost 빌드에서 GPU를 지원하지 않습니다. CPU hist로 재시도합니다.")
-                xgb_params["tree_method"] = "hist"
-                xgb_params["device"] = "cpu"
-                xgb_clf = xgb.XGBClassifier(**xgb_params)
-                cv_scores = cross_val_score(xgb_clf, X, y, cv=skf, scoring="roc_auc")
-            else:
-                raise
-        print(f"  {args.n_splits}-Fold CV AUC: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+        oof_prob = np.zeros(len(patient_ids), dtype=np.float32)
+        oof_pred = np.zeros(len(patient_ids), dtype=np.int64)
+        cv_scores = []
 
-        print("  전체 CV 예측 평가 중...")
-        cv_pred = cross_val_predict(xgb_clf, X, y, cv=skf, method="predict")
-        cv_prob = cross_val_predict(xgb_clf, X, y, cv=skf, method="predict_proba")[:, 1]
-        auc_cv = roc_auc_score(y, cv_prob)
+        for fold, (train_idx, val_idx) in enumerate(skf.split(patient_ids, y), start=1):
+            train_ids = [patient_ids[i] for i in train_idx]
+            val_ids = [patient_ids[i] for i in val_idx]
+            train_patients = subset_patients(patients, train_ids)
+            val_patients = subset_patients(patients, val_ids)
+            train_gas_cols = compute_gas_common_cols(train_patients)
+
+            X_train_df, y_train, _ = build_feature_matrix(train_patients, train_gas_cols)
+            X_val_df, y_val, _ = build_feature_matrix(val_patients, train_gas_cols)
+            X_train_df, X_val_df = align_feature_columns(X_train_df, X_val_df)
+
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train_df.values)
+            X_val = scaler.transform(X_val_df.values)
+
+            xgb_clf = make_xgb_classifier(xgb_params)
+            xgb_clf, xgb_params = fit_xgb_with_fallback(xgb_clf, xgb_params, X_train, y_train)
+
+            fold_prob = xgb_clf.predict_proba(X_val)[:, 1]
+            fold_pred = xgb_clf.predict(X_val)
+            fold_auc = roc_auc_score(y_val, fold_prob)
+            cv_scores.append(fold_auc)
+            oof_prob[val_idx] = fold_prob
+            oof_pred[val_idx] = fold_pred
+            print(
+                f"  Fold {fold}/{args.n_splits}: "
+                f"AUC={fold_auc:.3f} | train-gas-cols={len(train_gas_cols)} | "
+                f"features={X_train_df.shape[1]}"
+            )
+
+        auc_cv = roc_auc_score(y, oof_prob)
+        print(f"  {args.n_splits}-Fold CV AUC: {np.mean(cv_scores):.3f} ± {np.std(cv_scores):.3f}")
         print(f"  전체 {args.n_splits}-Fold CV AUC (aggregate): {auc_cv:.3f}")
-        plot_evaluation(y, cv_pred, cv_prob, label_names,
+        plot_evaluation(y, oof_pred, oof_prob, label_names,
                         f"XGBoost {args.n_splits}-Fold CV: HD vs COPD",
                         output_dir, "ml_cv")
 
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=0.2, stratify=y, random_state=42)
-        sc = StandardScaler()
-        X_tr_s = sc.fit_transform(X_tr)
-        X_te_s  = sc.transform(X_te)
+        train_ids, test_ids, _, _ = train_test_split(
+            patient_ids, y, test_size=0.2, stratify=y, random_state=42)
+        train_patients = subset_patients(patients, train_ids)
+        test_patients = subset_patients(patients, test_ids)
+        train_gas_cols = compute_gas_common_cols(train_patients)
 
-        try:
-            xgb_clf.fit(X_tr_s, y_tr,
-                        eval_set=[(X_te_s, y_te)], verbose=50)
-        except xgb.core.XGBoostError as exc:
-            if "gpu_hist" in str(exc) or "gpu_hist" in repr(exc):
-                print("  ⚠️  XGBoost GPU 미지원으로 CPU hist로 재학습합니다.")
-                xgb_params["tree_method"] = "hist"
-                xgb_params["device"] = "cpu"
-                xgb_clf = xgb.XGBClassifier(**xgb_params)
-                xgb_clf.fit(X_tr_s, y_tr,
-                            eval_set=[(X_te_s, y_te)], verbose=50)
-            else:
-                raise
+        X_tr_df, y_tr, _ = build_feature_matrix(train_patients, train_gas_cols)
+        X_te_df, y_te, _ = build_feature_matrix(test_patients, train_gas_cols)
+        X_tr_df, X_te_df = align_feature_columns(X_tr_df, X_te_df)
+
+        sc = StandardScaler()
+        X_tr_s = sc.fit_transform(X_tr_df.values)
+        X_te_s = sc.transform(X_te_df.values)
+
+        xgb_clf = make_xgb_classifier(xgb_params)
+        xgb_clf, _ = fit_xgb_with_fallback(
+            xgb_clf,
+            xgb_params,
+            X_tr_s,
+            y_tr,
+            eval_set=[(X_te_s, y_te)],
+        )
 
         y_pred = xgb_clf.predict(X_te_s)
         y_prob = xgb_clf.predict_proba(X_te_s)[:, 1]
@@ -749,7 +847,7 @@ def main(args):
                                  "XGBoost: HD vs COPD (v3)", output_dir, "ml")
         plot_feature_importance(xgb_clf, output_dir)
 
-        results_summary["XGBoost CV AUC"]    = f"{cv_scores.mean():.3f} ± {cv_scores.std():.3f}"
+        results_summary["XGBoost CV AUC"]    = f"{np.mean(cv_scores):.3f} ± {np.std(cv_scores):.3f}"
         results_summary["XGBoost CV AUC (agg)"] = f"{auc_cv:.3f}"
         results_summary["XGBoost Test AUC"]  = f"{auc_ml:.3f}"
         results_summary["XGBoost Accuracy"]  = f"{accuracy_score(y_te, y_pred):.3f}"
@@ -760,23 +858,12 @@ def main(args):
         print("🧠 DL 분석 (Multi-Sensor CNN v3: Attention + Gate)")
         print("="*55)
 
-        print("  시계열 텐서 변환 중...")
-        samples = []
-        for pat_id, info in sorted(patients.items()):
-            result = patient_to_tensors(info, gas_common_cols, args.seq_len)
-            if result is None:
-                print(f"  ⚠️  {pat_id}: 텐서 변환 실패 → 건너뜀")
-                continue
-            tensors, col_names_list = result
-            label_val = 1 if info["label"] == "COPD" else 0
-            samples.append(((tensors, col_names_list), label_val))
-
-        n_copd = sum(1 for _, l in samples if l == 1)
-        n_hd   = sum(1 for _, l in samples if l == 0)
-        print(f"  총 {len(samples)}명 (HD={n_hd}, COPD={n_copd}) 변환 완료")
+        patient_ids, y_dl = get_patient_ids_and_labels(patients)
+        print(f"  총 {len(patient_ids)}명 (HD={sum(y_dl==0)}, COPD={sum(y_dl==1)}) 기준으로 fold별 텐서 생성")
 
         fold_accs, all_probs, all_trues = train_dl(
-            samples, device, output_dir,
+            patients, device, output_dir,
+            seq_len=args.seq_len,
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
